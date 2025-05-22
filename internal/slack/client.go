@@ -275,17 +275,21 @@ func (c *Client) handleEventMessage(event slackevents.EventsAPIEvent) {
 
 			// Check if this is a message in an active thread
 			isInActiveThread := c.isActiveThread(ev.Channel, ev.ThreadTimeStamp)
+			containsBotMention := c.botMentionRgx.MatchString(ev.Text)
 
 			if isDirectMessage && isValidUser && isNotEdited && !isBot {
 				c.logger.InfoKV("Received direct message in channel", "channel", ev.Channel, "user", ev.User, "text", ev.Text)
 				// Add to message history
 				c.addToHistory(ev.Channel, "user", ev.Text)
 				go c.handleUserPrompt(ev.Text, ev.Channel, ev.ThreadTimeStamp) // Use goroutine to avoid blocking event loop
-			} else if isInActiveThread && isValidUser && isNotEdited && !isBot {
+			} else if isInActiveThread && isValidUser && isNotEdited && !isBot && !containsBotMention {
+				// FIXED: Only handle if it's NOT a bot mention (to avoid duplicate with AppMentionEvent)
 				c.logger.InfoKV("Received message in active thread", "channel", ev.Channel, "user", ev.User, "text", ev.Text, "thread", ev.ThreadTimeStamp)
 				// Add to message history
 				c.addToHistory(ev.Channel, "user", ev.Text)
 				go c.handleUserPrompt(ev.Text, ev.Channel, ev.ThreadTimeStamp)
+			} else if containsBotMention {
+				c.logger.DebugKV("Ignoring MessageEvent with bot mention - will be handled by AppMentionEvent", "channel", ev.Channel, "user", ev.User)
 			}
 
 		default:
