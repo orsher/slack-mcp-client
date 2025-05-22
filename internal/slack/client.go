@@ -440,10 +440,6 @@ func (c *Client) generateToolPrompt() string {
 	promptBuilder.WriteString("4. Do NOT include explanations, markdown formatting, or extra text with the JSON.\n")
 	promptBuilder.WriteString("4. If any required arguments are missing, do NOT generate the JSON. Instead, ask the user for the missing information.\n")
 	promptBuilder.WriteString("5. If no tool is needed, respond naturally to the user's request.\n\n")
-	// promptBuilder.WriteString("6. When receiving a tool response, if the response includes a nextAction. prompt it to the user and ask for confirmation. If the user confirms, follow the suggested next step as is it was requested by the user.\n\n")
-	// promptBuilder.WriteString("7. When receiving a tool response, if the response includes a automatedNextAction field. WRITE TO THE USER AT THE END OF YOUR RESPONSE 2 LINES OF TEXT EXACTLY AS FOLLOWS: 'Im executing the operation, please hold on...'\n")
-	// promptBuilder.WriteString(" a. NextAction: <automatedNextAction>\n")
-	// promptBuilder.WriteString(" b. 'Im executing the operation, please hold on...\n")
 
 	promptBuilder.WriteString("Available Tools:\n")
 
@@ -478,6 +474,8 @@ func (c *Client) generateToolPrompt() string {
 	// Emphasize again to help model handle this correctly
 	promptBuilder.WriteString("IMPORTANT: Return ONLY the raw JSON object with no explanations or formatting when using a tool.\n")
 
+	promptBuilder.WriteString("IMPORTANT INSTRUCTIONS about final response format:\n")
+	promptBuilder.WriteString("1. When returning a message to the user format it in a friendly way for slack")
 	return promptBuilder.String()
 }
 
@@ -554,7 +552,7 @@ func (c *Client) processLLMResponseAndReply(llmResponse, userPrompt, channelID, 
 	var isToolResult bool
 	var toolProcessingErr error
 	var toolResponses []string = []string{}
-	const maxToolCalls = 2
+	const maxToolCalls = 10
 	// Should add a while loop - first check if thats a tool response and then do th while
 	for {
 		if c.llmMCPBridge == nil {
@@ -599,15 +597,24 @@ func (c *Client) processLLMResponseAndReply(llmResponse, userPrompt, channelID, 
 
 			// Construct a new prompt incorporating the original prompt and the tool result
 			rePrompt := fmt.Sprintf(
-				`The user asked: '%s'\n\n
-			I used '%d' tool(s) and received the following results:
-			'
-			%s
-			'
-			RETURN WITH THE JSON OBJECT ONLY CONTAINING THE NEXT TOOL CALL.
-			If you still need some more information from available tools, please ask to run the required tool with the required arguments.
-			If you have all the information you need, or if you already reached the maximum number of tool calls which is %d, 
-			please formulate a concise and helpful natural language response to the user based *only* on the user's original question and the tool results provided.`,
+				`The user asked: '%s'
+
+I used '%d' tool(s) and received the following results:
+'
+%s
+'
+
+IMPORTANT INSTRUCTIONS:
+- If you have all the information you need to answer the user's original question, respond with a concise and helpful natural language answer.
+- If you are missing information that can be obtained by calling additional tools, respond ONLY with a JSON object specifying the next tool call and its required arguments.
+- You CANNOT call more than %d tool(s) in total. If you have reached this limit, you MUST respond in natural language with the best answer you can, even if some information is missing. In this case, clearly state what information is missing, if any.
+
+ALWAYS follow these rules:
+1. If you have enough information, answer in natural language.
+2. If you need more information and have not reached the tool call limit, respond ONLY with the JSON for the next tool call.
+3. If you have reached the tool call limit, answer in natural language with whatever information you have, and mention if anything is missing. Format the response in a friendly way for slack.
+
+RETURN ONLY THE REQUIRED RESPONSE FORMAT (either natural language or the JSON object for the next tool call). Do NOT include any explanations or extra text.`,
 				userPrompt, numberOfToolsUsed, formatToolResponses(toolResponses), maxToolCalls)
 
 			// Add history
