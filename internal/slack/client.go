@@ -331,15 +331,23 @@ func (c *Client) generateToolPrompt() string {
 	}
 
 	var promptBuilder strings.Builder
+	
+	promptBuilder.WriteString("You are experienced Site Reliability Engineer responsible for a set of applications running on Kubernetes infrastructure. People are coming to you to ask about situation in the clusters and to pick your brain on troubleshooting issues there. Your organization uses tool called \"Komodor's Kubernetes Management Platform\" to access the clusters. The clusters in our infra are:\n\n")
+	promptBuilder.WriteString("ci\nitiel-test-cluster-v2\nkomodor-staging\nlabs-e2e\nproduction\nproduction-rc-chart\n\n")
 	promptBuilder.WriteString("You have access to the following tools. Analyze the user's request to determine if a tool is needed.\n\n")
 
 	// Clear instructions on how to format the JSON response
 	promptBuilder.WriteString("TOOL USAGE INSTRUCTIONS:\n")
-	promptBuilder.WriteString("1. If a tool is appropriate AND you have ALL required arguments from the user's request, respond with ONLY the JSON object.\n")
-	promptBuilder.WriteString("2. The JSON MUST be properly formatted with no additional text before or after.\n")
-	promptBuilder.WriteString("3. Do NOT include explanations, markdown formatting, or extra text with the JSON.\n")
+	promptBuilder.WriteString("1. If a tool is appropriate AND you have ALL required arguments from users request or from previous tool calls. if tool has defaults use them, respond with ONLY the JSON object.\n")
+	promptBuilder.WriteString("2. If you missing some inputs, inspect the tool's input schema to find if there's another tool that can be used to get the missing information. If so, call that tool first.\n")
+	promptBuilder.WriteString("3. The JSON MUST be properly formatted with no additional text before or after.\n")
+	promptBuilder.WriteString("4. Do NOT include explanations, markdown formatting, or extra text with the JSON.\n")
 	promptBuilder.WriteString("4. If any required arguments are missing, do NOT generate the JSON. Instead, ask the user for the missing information.\n")
 	promptBuilder.WriteString("5. If no tool is needed, respond naturally to the user's request.\n\n")
+	// promptBuilder.WriteString("6. When receiving a tool response, if the response includes a nextAction. prompt it to the user and ask for confirmation. If the user confirms, follow the suggested next step as is it was requested by the user.\n\n")
+	// promptBuilder.WriteString("7. When receiving a tool response, if the response includes a automatedNextAction field. WRITE TO THE USER AT THE END OF YOUR RESPONSE 2 LINES OF TEXT EXACTLY AS FOLLOWS: 'Im executing the operation, please hold on...'\n")
+	// promptBuilder.WriteString(" a. NextAction: <automatedNextAction>\n")
+	// promptBuilder.WriteString(" b. 'Im executing the operation, please hold on...\n")
 
 	promptBuilder.WriteString("Available Tools:\n")
 
@@ -449,67 +457,87 @@ func (c *Client) processLLMResponseAndReply(llmResponse, userPrompt, channelID, 
 	var finalResponse string
 	var isToolResult bool
 	var toolProcessingErr error
-
-	if c.llmMCPBridge == nil {
-		// If bridge is nil, just use the original response
-		finalResponse = llmResponse
-		isToolResult = false
-		toolProcessingErr = nil
-		c.logger.Warn("LLMMCPBridge is nil, skipping tool processing")
-	} else {
-		// Process the response through the bridge
-		processedResponse, err := c.llmMCPBridge.ProcessLLMResponse(ctx, llmResponse, userPrompt)
-		if err != nil {
-			finalResponse = fmt.Sprintf("Sorry, I encountered an error while trying to use a tool: %v", err)
+	var toolResponses []string = []string{}
+	const maxToolCalls = 2
+	// Should add a while loop - first check if thats a tool response and then do th while
+	for{
+		if c.llmMCPBridge == nil {
+			// If bridge is nil, just use the original response
+			finalResponse = llmResponse
 			isToolResult = false
-			toolProcessingErr = err // Store the error
-		} else {
-			// If the processed response is different from the original, a tool was executed
-			if processedResponse != llmResponse {
-				finalResponse = processedResponse
-				isToolResult = true
+			toolProcessingErr = nil
+			c.logger.Warn("LLMMCPBridge is nil, skipping tool processing")
 			} else {
-				// No tool was executed
-				finalResponse = llmResponse
+			// Process the response through the bridge
+			processedResponse, err := c.llmMCPBridge.ProcessLLMResponse(ctx, llmResponse, userPrompt)
+			if err != nil {
+				finalResponse = fmt.Sprintf("Sorry, I encountered an error while trying to use a tool: %v", err)
 				isToolResult = false
+				toolProcessingErr = err // Store the error
+			} else {
+				// If the processed response is different from the original, a tool was executed
+				if processedResponse != llmResponse {
+					finalResponse = processedResponse
+					isToolResult = true
+				} else {
+					// No tool was executed
+					finalResponse = llmResponse
+					isToolResult = false
+				}
 			}
 		}
-	}
-	// --- End of Process Tool Response Logic ---
+		// --- End of Process Tool Response Logic ---
 
-	if toolProcessingErr != nil {
-		c.logger.ErrorKV("Tool processing error", "error", toolProcessingErr)
-		c.postMessage(channelID, threadTS, finalResponse) // Post the error message
-		return
-	}
-
-	if isToolResult {
-		c.logger.Debug("Tool executed. Re-prompting LLM with tool result.")
-		c.logger.DebugKV("Tool result", "result", truncateForLog(finalResponse, 500))
-
-		// Construct a new prompt incorporating the original prompt and the tool result
-		rePrompt := fmt.Sprintf("The user asked: '%s'\n\nI used a tool and received the following result:\n```\n%s\n```\nPlease formulate a concise and helpful natural language response to the user based *only* on the user's original question and the tool result provided.", userPrompt, finalResponse)
-
-		// Add history
-		c.addToHistory(channelID, "assistant", llmResponse) // Original LLM response (tool call JSON)
-		c.addToHistory(channelID, "tool", finalResponse)    // Tool execution result
-
-		c.logger.DebugKV("Re-prompting LLM", "prompt", rePrompt)
-
-		// Re-prompt using the LLM client
-		var repromptErr error
-		// Get the provider name from config again for the re-prompt
-		providerName := c.cfg.LLMProvider
-		finalResponse, repromptErr = c.callLLM(providerName, rePrompt, c.getContextFromHistory(channelID))
-		if repromptErr != nil {
-			c.logger.ErrorKV("Error during LLM re-prompt", "error", repromptErr)
-			// Fallback: Show the tool result and the error
-			finalResponse = fmt.Sprintf("Tool Result:\n```%s```\n\n(Error generating final response: %v)", finalResponse, repromptErr)
+		if toolProcessingErr != nil {
+			c.logger.ErrorKV("Tool processing error", "error", toolProcessingErr)
+			c.postMessage(channelID, threadTS, finalResponse) // Post the error message
+			return
 		}
-	} else {
-		// No tool was executed, add assistant response to history
-		c.addToHistory(channelID, "assistant", finalResponse)
+
+		if isToolResult {
+			c.postMessage(channelID, threadTS, "Running tool...") // Post the error message
+			toolResponses = append(toolResponses, finalResponse)
+			numberOfToolsUsed := len(toolResponses)
+			c.logger.Debug("Tool executed. Re-prompting LLM with tool result.")
+			c.logger.DebugKV("Tool result", "result", truncateForLog(finalResponse, 500))
+
+			// Construct a new prompt incorporating the original prompt and the tool result
+			rePrompt := fmt.Sprintf(
+			`The user asked: '%s'\n\n
+			I used '%d' tool(s) and received the following results:
+			'
+			%s
+			'
+			RETURN WITH THE JSON OBJECT ONLY CONTAINING THE NEXT TOOL CALL.
+			If you still need some more information from available tools, please ask to run the required tool with the required arguments.
+			If you have all the information you need, or if you already reached the maximum number of tool calls which is %d, 
+			please formulate a concise and helpful natural language response to the user based *only* on the user's original question and the tool results provided.`,
+			userPrompt, numberOfToolsUsed, formatToolResponses(toolResponses), maxToolCalls)
+
+			// Add history
+			c.addToHistory(channelID, "assistant", llmResponse) // Original LLM response (tool call JSON)
+			c.addToHistory(channelID, "tool", finalResponse)    // Tool execution result
+
+			c.logger.DebugKV("Re-prompting LLM", "prompt", rePrompt)
+
+			// Re-prompt using the LLM client
+			var repromptErr error
+			// Get the provider name from config again for the re-prompt
+			providerName := c.cfg.LLMProvider
+			finalResponse, repromptErr = c.callLLM(providerName, rePrompt, c.getContextFromHistory(channelID))
+			if repromptErr != nil {
+				c.logger.ErrorKV("Error during LLM re-prompt", "error", repromptErr)
+				// Fallback: Show the tool result and the error
+				finalResponse = fmt.Sprintf("Tool Result:\n```%s```\n\n(Error generating final response: %v)", finalResponse, repromptErr)
+			}
+			llmResponse = finalResponse
+		}
+
+		if !isToolResult {
+			break
+		}
 	}
+	c.addToHistory(channelID, "assistant", finalResponse)
 
 	// Send the final response back to Slack
 	if finalResponse == "" {
@@ -607,4 +635,16 @@ func (c *Client) postMessage(channelID, threadTS, text string) {
 			}
 		}
 	}
+}
+
+// formatToolResponses formats tool responses for LLM re-prompting.
+func formatToolResponses(responses []string) string {
+	if len(responses) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, resp := range responses {
+		sb.WriteString(fmt.Sprintf("Tool #%d response:\n%s\n_____\n", i+1, resp))
+	}
+	return sb.String()
 }
