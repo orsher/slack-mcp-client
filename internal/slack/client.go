@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/slack-go/slack"
@@ -39,6 +40,9 @@ type Client struct {
 	messageHistory  map[string][]Message
 	historyLimit    int
 	discoveredTools map[string]common.ToolInfo
+	//
+	activeThreads map[string]bool // key: "channel:thread_ts", value: true if bot is active in thread
+	threadMutex   sync.RWMutex    // protects activeThreads map
 }
 
 // Message represents a message in the conversation history
@@ -174,6 +178,30 @@ func (c *Client) Run() error {
 	return c.Socket.Run()
 }
 
+func (c *Client) getOriginalMessage(channel, threadTS string) (string, error) {
+	// Use Slack API to get the message
+	params := &slack.GetConversationHistoryParameters{
+		ChannelID: channel,
+		Latest:    threadTS,
+		Oldest:    threadTS,
+		Limit:     1,
+		Inclusive: true,
+	}
+
+	history, err := c.api.GetConversationHistory(params)
+	if err != nil {
+		return "", fmt.Errorf("failed to get conversation history: %w", err)
+	}
+
+	if len(history.Messages) == 0 {
+		return "", fmt.Errorf("no messages found for thread timestamp %s", threadTS)
+	}
+
+	originalMessage := history.Messages[0]
+
+	return originalMessage.Text, nil
+}
+
 // handleEvents listens for incoming events and dispatches them.
 func (c *Client) handleEvents() {
 	for evt := range c.Socket.Events {
@@ -208,11 +236,36 @@ func (c *Client) handleEventMessage(event slackevents.EventsAPIEvent) {
 		switch ev := innerEvent.Data.(type) {
 		case *slackevents.AppMentionEvent:
 			c.logger.InfoKV("Received app mention in channel", "channel", ev.Channel, "user", ev.User, "text", ev.Text)
-			messageText := c.botMentionRgx.ReplaceAllString(ev.Text, "")
+
+			var promptText string
+			var threadTS string
+
+			// Check if this mention is in a thread
+			if ev.ThreadTimeStamp != "" {
+				threadTS = ev.ThreadTimeStamp
+				originalMessage, err := c.getOriginalMessage(ev.Channel, ev.ThreadTimeStamp)
+				if err != nil {
+					c.logger.ErrorKV("Failed to fetch original message", "error", err, "channel", ev.Channel, "thread_ts", ev.ThreadTimeStamp)
+					// Fallback to the mention text
+					promptText = c.botMentionRgx.ReplaceAllString(ev.Text, "")
+				} else {
+					promptText = originalMessage
+					c.logger.InfoKV("Using original message as prompt", "original", originalMessage)
+				}
+			} else {
+				// This is a direct mention, not in a thread
+				threadTS = ev.TimeStamp // This becomes the thread root
+				promptText = c.botMentionRgx.ReplaceAllString(ev.Text, "")
+			}
+
 			// Add to message history
-			c.addToHistory(ev.Channel, "user", messageText)
-			// Use handleUserPrompt for app mentions too, for consistency
-			go c.handleUserPrompt(strings.TrimSpace(messageText), ev.Channel, ev.TimeStamp)
+			c.addToHistory(ev.Channel, "user", promptText)
+
+			// Mark this thread as active
+			c.addActiveThread(ev.Channel, threadTS)
+
+			// Use handleUserPrompt
+			go c.handleUserPrompt(strings.TrimSpace(promptText), ev.Channel, threadTS)
 
 		case *slackevents.MessageEvent:
 			isDirectMessage := strings.HasPrefix(ev.Channel, "D")
@@ -220,11 +273,19 @@ func (c *Client) handleEventMessage(event slackevents.EventsAPIEvent) {
 			isNotEdited := ev.SubType != "message_changed"
 			isBot := ev.BotID != "" || ev.SubType == "bot_message"
 
+			// Check if this is a message in an active thread
+			isInActiveThread := c.isActiveThread(ev.Channel, ev.ThreadTimeStamp)
+
 			if isDirectMessage && isValidUser && isNotEdited && !isBot {
 				c.logger.InfoKV("Received direct message in channel", "channel", ev.Channel, "user", ev.User, "text", ev.Text)
 				// Add to message history
 				c.addToHistory(ev.Channel, "user", ev.Text)
 				go c.handleUserPrompt(ev.Text, ev.Channel, ev.ThreadTimeStamp) // Use goroutine to avoid blocking event loop
+			} else if isInActiveThread && isValidUser && isNotEdited && !isBot {
+				c.logger.InfoKV("Received message in active thread", "channel", ev.Channel, "user", ev.User, "text", ev.Text, "thread", ev.ThreadTimeStamp)
+				// Add to message history
+				c.addToHistory(ev.Channel, "user", ev.Text)
+				go c.handleUserPrompt(ev.Text, ev.Channel, ev.ThreadTimeStamp)
 			}
 
 		default:
@@ -324,6 +385,41 @@ func (c *Client) handleUserPrompt(userPrompt, channelID, threadTS string) {
 	c.processLLMResponseAndReply(llmResponse, userPrompt, channelID, threadTS)
 }
 
+// Add methods to manage active threads
+func (c *Client) addActiveThread(channel, threadTS string) {
+	c.threadMutex.Lock()
+	defer c.threadMutex.Unlock()
+
+	if c.activeThreads == nil {
+		c.activeThreads = make(map[string]bool)
+	}
+
+	key := fmt.Sprintf("%s:%s", channel, threadTS)
+	c.activeThreads[key] = true
+	c.logger.InfoKV("Added active thread", "key", key)
+}
+
+func (c *Client) isActiveThread(channel, threadTS string) bool {
+	c.threadMutex.RLock()
+	defer c.threadMutex.RUnlock()
+
+	if threadTS == "" {
+		return false
+	}
+
+	key := fmt.Sprintf("%s:%s", channel, threadTS)
+	return c.activeThreads[key]
+}
+
+func (c *Client) removeActiveThread(channel, threadTS string) {
+	c.threadMutex.Lock()
+	defer c.threadMutex.Unlock()
+
+	key := fmt.Sprintf("%s:%s", channel, threadTS)
+	delete(c.activeThreads, key)
+	c.logger.InfoKV("Removed active thread", "key", key)
+}
+
 // generateToolPrompt generates the prompt string for available tools
 func (c *Client) generateToolPrompt() string {
 	if len(c.discoveredTools) == 0 {
@@ -331,7 +427,7 @@ func (c *Client) generateToolPrompt() string {
 	}
 
 	var promptBuilder strings.Builder
-	
+
 	promptBuilder.WriteString("You are experienced Site Reliability Engineer responsible for a set of applications running on Kubernetes infrastructure. People are coming to you to ask about situation in the clusters and to pick your brain on troubleshooting issues there. Your organization uses tool called \"Komodor's Kubernetes Management Platform\" to access the clusters. The clusters in our infra are:\n\n")
 	promptBuilder.WriteString("ci\nitiel-test-cluster-v2\nkomodor-staging\nlabs-e2e\nproduction\nproduction-rc-chart\n\n")
 	promptBuilder.WriteString("You have access to the following tools. Analyze the user's request to determine if a tool is needed.\n\n")
@@ -460,14 +556,14 @@ func (c *Client) processLLMResponseAndReply(llmResponse, userPrompt, channelID, 
 	var toolResponses []string = []string{}
 	const maxToolCalls = 2
 	// Should add a while loop - first check if thats a tool response and then do th while
-	for{
+	for {
 		if c.llmMCPBridge == nil {
 			// If bridge is nil, just use the original response
 			finalResponse = llmResponse
 			isToolResult = false
 			toolProcessingErr = nil
 			c.logger.Warn("LLMMCPBridge is nil, skipping tool processing")
-			} else {
+		} else {
 			// Process the response through the bridge
 			processedResponse, err := c.llmMCPBridge.ProcessLLMResponse(ctx, llmResponse, userPrompt)
 			if err != nil {
@@ -503,7 +599,7 @@ func (c *Client) processLLMResponseAndReply(llmResponse, userPrompt, channelID, 
 
 			// Construct a new prompt incorporating the original prompt and the tool result
 			rePrompt := fmt.Sprintf(
-			`The user asked: '%s'\n\n
+				`The user asked: '%s'\n\n
 			I used '%d' tool(s) and received the following results:
 			'
 			%s
@@ -512,7 +608,7 @@ func (c *Client) processLLMResponseAndReply(llmResponse, userPrompt, channelID, 
 			If you still need some more information from available tools, please ask to run the required tool with the required arguments.
 			If you have all the information you need, or if you already reached the maximum number of tool calls which is %d, 
 			please formulate a concise and helpful natural language response to the user based *only* on the user's original question and the tool results provided.`,
-			userPrompt, numberOfToolsUsed, formatToolResponses(toolResponses), maxToolCalls)
+				userPrompt, numberOfToolsUsed, formatToolResponses(toolResponses), maxToolCalls)
 
 			// Add history
 			c.addToHistory(channelID, "assistant", llmResponse) // Original LLM response (tool call JSON)
